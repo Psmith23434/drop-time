@@ -7,22 +7,28 @@ Fetches the EXACT drop time for pending-delete domains from two sources:
   Source 1 - Dynadot backorder page  (primary)
              URL  : https://www.dynadot.com/market/backorder/{domain}
              HTML : <div class="domain-info-text">
-                      <span ...>Drop Time:</span>
-                      <span style="font-size:24px;">2026/04/08 10:45 PST</span>
+                      <span style="opacity:0.4">Drop Time:</span>
+                      <span style="font-size:24px">2026/04/08 10:45 PST</span>
                     </div>
-             Selector: .domain-info-text span:nth-of-type(2)  (second span = the value)
+             Note : Cloudflare challenge fires on first visit -- a checkbox
+                    CAPTCHA appears; click it once.  The persistent browser
+                    profile remembers the CF cookie so subsequent runs are
+                    instant (no challenge).
 
   Source 2 - ExpiredDomains.net per-domain detail page  (fallback)
              URL  : https://member.expireddomains.net/domain/{domain}
              HTML : <table class="base1 small listing">
-                      <tr><td>End Date</td>
-                          <td><a class="verified1">2026-04-08</a></td></tr>
+                      <tr><td>Added to List</td><td>2026-04-04</td></tr>
+                      <tr>
+                        <td>End Date</td>
+                        <td><a class="verified1">2026-04-08</a></td>
+                      </tr>
                     </table>
-             Selector: find <tr> whose first <td> = "End Date",
-                       then read the <a class="verified1"> (or bare <td>) in that row.
+             Note : Requires an ExpiredDomains.net account.  Log in once in
+                    the browser window that opens -- the persistent profile
+                    keeps you logged in for future runs.
 
 Both sources give exact drop times sourced from registrar data.
-At 5 domains/day, both are well within polite usage limits.
 
 Usage:
   python drop_time_scraper.py zenithpicks.com reviewindex.com
@@ -31,20 +37,14 @@ Usage:
   python drop_time_scraper.py --json zenithpicks.com
   python drop_time_scraper.py --browser-path "C:\\path\\to\\msedge.exe" zenithpicks.com
 
-Chrome binary auto-detection order:
-  1. --browser-path CLI argument
-  2. CHROME_PATH environment variable
-  3. Common Windows paths (Chrome, Edge, Brave, Chromium)
-  4. Common macOS / Linux paths
-  5. PATH lookup
-
 Notes on Edge + nodriver:
   - headless=False is used intentionally.  Cloudflare (Dynadot) and
     ExpiredDomains.net both detect --headless mode even with nodriver.
-    The browser window opens minimised and closes when done.
-  - A persistent profile dir is used so Cloudflare challenge cookies
-    survive between runs.  Location: %APPDATA%/DropTimeSniper/profile
-    (Windows) or ~/.config/DropTimeSniper/profile (Linux/macOS).
+    The browser window opens minimised (1x1 px) and closes when done.
+  - Persistent profile location:
+      Windows : %%APPDATA%%\\DropTimeSniper\\browser_profile
+      macOS   : ~/Library/Application Support/DropTimeSniper/browser_profile
+      Linux   : ~/.config/DropTimeSniper/browser_profile
 """
 
 from __future__ import annotations
@@ -62,6 +62,17 @@ from zoneinfo import ZoneInfo
 
 PST = ZoneInfo("America/Los_Angeles")
 UTC = timezone.utc
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers  (source-tagged, timestamped)
+# ---------------------------------------------------------------------------
+
+def _log(tag: str, msg: str) -> None:
+    """Print a timestamped, source-tagged log line to stdout."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] [{tag}] {msg}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Persistent browser profile  (survives CF challenges between runs)
@@ -159,12 +170,11 @@ class DropResult:
         self.drop_dt_pst = dt.astimezone(PST)
 
     def display(self) -> str:
-        icon = {"exact": "[EXACT]", "estimated": "[EST] ", "failed": "[FAIL]"}.get(
-            self.confidence, "[ ?? ]"
-        )
+        icon = {"exact": "[EXACT]", "estimated": "[EST] ", "failed": "[FAIL]",
+                "unknown": "[ ?? ]"}.get(self.confidence, "[ ?? ]")
         if self.drop_dt_utc:
             utc_s = self.drop_dt_utc.strftime("%Y-%m-%d %H:%M UTC")
-            pst_s = self.drop_dt_pst.strftime("%Y-%m-%d %H:%M PST")
+            pst_s = self.drop_dt_pst.strftime("%Y-%m-%d %H:%M PST")  # type: ignore[union-attr]
             return (
                 f"{icon}  {self.domain}\n"
                 f"   Drop Time  : {utc_s}  ({pst_s})\n"
@@ -229,21 +239,21 @@ async def _make_browser(chrome_bin: str, profile_dir: str):
     Launch a nodriver browser.
 
     headless=False is intentional:
-      - Cloudflare (used by Dynadot) detects headless even with nodriver on Edge.
-      - ExpiredDomains.net has its own bot check that also trips on headless.
-      - With headless=False the window opens minimised and closes when done.
+      - Cloudflare (Dynadot) detects headless even with nodriver on Edge.
+      - ExpiredDomains.net also trips on headless.
+      - Window opens at 1x1 px (bottom-left corner) and closes when done.
 
-    A persistent profile is used so CF challenge cookies survive between runs.
+    Persistent profile: CF challenge cookies and ED login survive between runs.
     """
     import nodriver as uc
     config = uc.Config(
-        headless=False,                          # must be False for CF + ED
+        headless=False,
         browser_executable_path=chrome_bin,
-        user_data_dir=profile_dir,               # persistent, not tempfile
+        user_data_dir=profile_dir,
         browser_args=[
             "--no-sandbox",
             "--disable-gpu",
-            "--window-size=1,1",                 # minimised - 1x1 px window
+            "--window-size=1,1",
             "--window-position=0,0",
             "--disable-extensions",
             "--disable-dev-shm-usage",
@@ -253,10 +263,7 @@ async def _make_browser(chrome_bin: str, profile_dir: str):
 
 
 async def _safe_get(browser, url: str, retries: int = 2):
-    """
-    browser.get() on Edge sometimes returns None on the first call.
-    Retry up to `retries` times with a short back-off.
-    """
+    """browser.get() on Edge can return None on the first call; retry."""
     for attempt in range(retries + 1):
         page = await browser.get(url)
         if page is not None:
@@ -270,38 +277,33 @@ async def _safe_get(browser, url: str, retries: int = 2):
 # Source 1 -- Dynadot backorder page
 # ---------------------------------------------------------------------------
 #
-# Exact HTML (confirmed):
+# Confirmed HTML:
 #   <div class="domain-info-text" data-v-5ee84fcc="">
 #     <span style="opacity:0.4;" data-v-5ee84fcc="">Drop Time:</span>
 #     <span style="font-size:24px;" data-v-5ee84fcc="">2026/04/08 10:45 PST</span>
 #   </div>
 #
-# Strategy:
-#   1. querySelector('.domain-info-text')  -- finds the container div
-#      Note: Vue scoped data-v-* attributes don't affect CSS class selectors.
-#   2. Within that div, grab the SECOND span (index 1) -- that is always the value.
-#   3. Regex fallback over body text if the selector misses (e.g. DOM change).
+# The Vue data-v-* scoped attributes don't affect CSS class selectors.
+# We find every .domain-info-text container, look for the span labelled
+# 'Drop Time:' (spans[0]), and return the NEXT sibling span (spans[1]).
 # ---------------------------------------------------------------------------
 
-# JS injected into the Dynadot page
 _DYNADOT_JS = """
 (function() {
-    // Primary: .domain-info-text  second <span> is always the drop-time value
     var containers = document.querySelectorAll('.domain-info-text');
     for (var i = 0; i < containers.length; i++) {
         var spans = containers[i].querySelectorAll('span');
-        // spans[0] = label ("Drop Time:"), spans[1] = value ("2026/04/08 10:45 PST")
         if (spans.length >= 2) {
-            var label = spans[0].innerText || spans[0].textContent || '';
+            var label = (spans[0].innerText || spans[0].textContent || '').trim();
             if (label.indexOf('Drop Time') !== -1) {
                 var val = (spans[1].innerText || spans[1].textContent || '').trim();
                 if (val) return val;
             }
         }
     }
-    // Fallback: regex over entire visible body text
-    var bodyText = document.body ? (document.body.innerText || document.body.textContent || '') : '';
-    var m = bodyText.match(/(\\d{4}\\/\\d{2}\\/\\d{2}\\s+\\d{2}:\\d{2}\\s*(?:PST|PDT|UTC))/i);
+    // Fallback: regex over body text
+    var body = document.body ? (document.body.innerText || document.body.textContent || '') : '';
+    var m = body.match(/(\\d{4}\\/\\d{2}\\/\\d{2}\\s+\\d{2}:\\d{2}\\s*(?:PST|PDT|UTC))/i);
     return m ? m[1].trim() : null;
 })()
 """
@@ -310,8 +312,13 @@ _DYNADOT_JS = """
 async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> DropResult:
     """
     Loads https://www.dynadot.com/market/backorder/{domain}
-    and reads the 'Drop Time' span.
+    and extracts the 'Drop Time' span value.
+
+    First-run note: Cloudflare shows a checkbox CAPTCHA.  Click it in the
+    browser window that opens.  The persistent profile caches the CF cookie
+    so subsequent runs skip the challenge entirely.
     """
+    SOURCE = "Dynadot"
     result = DropResult(domain)
     browser = None
     try:
@@ -320,33 +327,34 @@ async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> Dro
         chrome_bin = _find_chrome_binary(browser_path)
         if not chrome_bin:
             result.error = (
-                "No browser found. Install Chrome/Edge/Brave or set "
-                "CHROME_PATH env var."
+                "No browser found. Install Chrome/Edge/Brave or set CHROME_PATH."
             )
+            _log(SOURCE, f"ERROR  {result.error}")
             return result
 
-        print(f"      Browser : {chrome_bin}", flush=True)
-        print("      Launching (Dynadot)...", flush=True)
+        _log(SOURCE, f"Browser  : {chrome_bin}")
+        _log(SOURCE, f"Profile  : {_profile_dir()}")
+        _log(SOURCE, f"Fetching : https://www.dynadot.com/market/backorder/{domain}")
 
         profile = str(_profile_dir())
         browser = await _make_browser(chrome_bin, profile)
         if browser is None:
-            result.error = "Browser.create() returned None -- binary may be unsupported."
+            result.error = "Browser.create() returned None."
+            _log(SOURCE, f"ERROR  {result.error}")
             return result
 
-        # Correct URL: no query string required
         url = f"https://www.dynadot.com/market/backorder/{domain}"
         page = await _safe_get(browser, url)
         if page is None:
-            result.error = (
-                "browser.get() returned None after retries. "
-                "Edge may need a warm-up -- try again or use --browser-path chrome.exe"
-            )
+            result.error = "browser.get() returned None after retries."
+            _log(SOURCE, f"ERROR  {result.error}")
             return result
 
+        _log(SOURCE, "Page loaded -- polling for Drop Time element (max 30s)...")
+        _log(SOURCE, "  >> If a Cloudflare checkbox appears, click it in the browser window.")
+
         drop_text: Optional[str] = None
-        # Poll up to 30 s (page may need to pass CF challenge first)
-        for _ in range(60):
+        for tick in range(60):      # 60 × 0.5s = 30 s
             await asyncio.sleep(0.5)
             try:
                 val = await page.evaluate(_DYNADOT_JS)
@@ -355,24 +363,33 @@ async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> Dro
                     break
             except Exception:
                 pass
+            if tick > 0 and tick % 10 == 0:
+                _log(SOURCE, f"  ... still waiting ({tick // 2}s elapsed)")
 
         if drop_text:
             dt = _parse_dt(drop_text)
             result.set_dt(dt, "Dynadot backorder page", "exact", drop_text)
+            _log(SOURCE, f"SUCCESS  Raw     : {drop_text}")
+            _log(SOURCE, f"         UTC     : {result.drop_dt_utc.strftime('%Y-%m-%d %H:%M UTC')}")
+            _log(SOURCE, f"         PST     : {result.drop_dt_pst.strftime('%Y-%m-%d %H:%M PST')}")
+            _log(SOURCE, f"         Source  : {result.source}")
         else:
             result.error = (
-                "Dynadot: page loaded but 'Drop Time' not found. "
+                "'Drop Time' element not found after 30s. "
                 "Domain may not be in pendingDelete, or Dynadot changed their DOM."
             )
+            _log(SOURCE, f"ERROR  {result.error}")
 
     except ImportError:
         result.error = "nodriver not installed -- run: pip install nodriver"
+        _log(SOURCE, f"ERROR  {result.error}")
     except Exception as e:
-        result.error = f"Dynadot error: {type(e).__name__}: {e}"
+        result.error = f"{type(e).__name__}: {e}"
+        _log(SOURCE, f"ERROR  {result.error}")
     finally:
         if browser is not None:
             try:
-                await asyncio.sleep(0.3)   # let nodriver finish cleanup
+                await asyncio.sleep(0.3)
                 await browser.stop()
             except Exception:
                 pass
@@ -383,43 +400,63 @@ async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> Dro
 # Source 2 -- ExpiredDomains.net per-domain detail page
 # ---------------------------------------------------------------------------
 #
-# Exact HTML (confirmed):
-#   URL: https://member.expireddomains.net/domain/{domain}
+# Confirmed HTML (member.expireddomains.net/domain/{domain}):
 #
 #   <table class="base1 small listing">
 #     <tbody>
-#       <tr><td>Added to List</td><td>2026-04-04</td></tr>
+#       <tr><td>Added to List</td><td>2026-04-04</td></tr>   <- NOT this row
 #       <tr>
-#         <td>End Date</td>
-#         <td><a href="..." class="verified1" title="Date is most likely accurate">2026-04-08</a></td>
+#         <td>End Date</td>                                  <- match THIS label
+#         <td><a class="verified1">2026-04-08</a></td>       <- return this text
 #       </tr>
-#       <tr><td>Backorder</td><td>...</td></tr>
 #     </tbody>
 #   </table>
 #
-# Strategy:
-#   Walk all <tr> elements in table.base1.
-#   Find the row where the first <td> innerText == "End Date".
-#   In that row, return the text of the second <td>
-#   (either the <a class="verified1"> text or plain td text).
+# BUG THAT WAS FIXED:
+#   The old code used  label === 'End Date'  but innerText frequently has a
+#   trailing newline ("End Date\n"), causing the match to fail silently.
+#   The loop then fell through and the NEXT date found was "Added to List"
+#   -> "2026-04-04" (the wrong date).
+#
+# Fix: explicitly trim() the label before comparing, AND use textContent as
+# fallback in case innerText is undefined (e.g. hidden elements).
 # ---------------------------------------------------------------------------
 
 _EXPDOM_JS = """
 (function() {
+    // Walk every row in any table.base1 on this page
     var rows = document.querySelectorAll('table.base1 tr');
     for (var i = 0; i < rows.length; i++) {
         var cells = rows[i].querySelectorAll('td');
         if (cells.length < 2) continue;
-        var label = (cells[0].innerText || cells[0].textContent || '').trim();
-        if (label === 'End Date') {
-            // Prefer the <a class="verified1"> text -- it's the confirmed date
-            var link = cells[1].querySelector('a.verified1');
-            if (link) {
-                return (link.innerText || link.textContent || '').trim();
-            }
-            // Fallback: any text in the cell
-            return (cells[1].innerText || cells[1].textContent || '').trim();
+
+        // FIX: trim() both innerText and textContent before comparing.
+        // innerText can include trailing newlines; textContent is the fallback.
+        var label = '';
+        if (typeof cells[0].innerText !== 'undefined') {
+            label = cells[0].innerText.trim();
         }
+        if (!label && typeof cells[0].textContent !== 'undefined') {
+            label = cells[0].textContent.trim();
+        }
+
+        // Only match the 'End Date' row -- not 'Added to List' or any other row
+        if (label !== 'End Date') continue;
+
+        // Prefer <a class="verified1"> -- its title says 'Date is most likely accurate'
+        var link = cells[1].querySelector('a.verified1');
+        if (link) {
+            var linkText = '';
+            if (typeof link.innerText !== 'undefined') linkText = link.innerText.trim();
+            if (!linkText && typeof link.textContent !== 'undefined') linkText = link.textContent.trim();
+            if (linkText) return linkText;
+        }
+
+        // Fallback: plain cell text
+        var cellText = '';
+        if (typeof cells[1].innerText !== 'undefined') cellText = cells[1].innerText.trim();
+        if (!cellText && typeof cells[1].textContent !== 'undefined') cellText = cells[1].textContent.trim();
+        return cellText || null;
     }
     return null;
 })()
@@ -429,8 +466,12 @@ _EXPDOM_JS = """
 async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None) -> DropResult:
     """
     Loads https://member.expireddomains.net/domain/{domain}
-    and reads the 'End Date' row from the detail table.
+    and reads the 'End Date' row (NOT 'Added to List') from table.base1.
+
+    Requires an ExpiredDomains.net login.  On first run the login page may
+    appear -- log in manually; the persistent profile keeps you signed in.
     """
+    SOURCE = "ExpiredDomains"
     result = DropResult(domain)
     browser = None
     try:
@@ -438,31 +479,33 @@ async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None)
 
         chrome_bin = _find_chrome_binary(browser_path)
         if not chrome_bin:
-            result.error = (
-                "No browser found. Install Chrome/Edge/Brave or set "
-                "CHROME_PATH env var."
-            )
+            result.error = "No browser found. Install Chrome/Edge/Brave or set CHROME_PATH."
+            _log(SOURCE, f"ERROR  {result.error}")
             return result
 
-        print(f"      Browser : {chrome_bin}", flush=True)
-        print("      Launching (ExpiredDomains)...", flush=True)
+        _log(SOURCE, f"Browser  : {chrome_bin}")
+        _log(SOURCE, f"Profile  : {_profile_dir()}")
+        _log(SOURCE, f"Fetching : https://member.expireddomains.net/domain/{domain}")
 
         profile = str(_profile_dir())
         browser = await _make_browser(chrome_bin, profile)
         if browser is None:
-            result.error = "Browser.create() returned None -- binary may be unsupported."
+            result.error = "Browser.create() returned None."
+            _log(SOURCE, f"ERROR  {result.error}")
             return result
 
-        # Correct URL: per-domain detail page on member. subdomain
         url = f"https://member.expireddomains.net/domain/{domain}"
         page = await _safe_get(browser, url)
         if page is None:
             result.error = "browser.get() returned None after retries."
+            _log(SOURCE, f"ERROR  {result.error}")
             return result
 
+        _log(SOURCE, "Page loaded -- polling for 'End Date' row in table.base1 (max 40s)...")
+        _log(SOURCE, "  >> If the login page appears, sign in to ExpiredDomains.net.")
+
         drop_text: Optional[str] = None
-        # Poll up to 40 s -- ExpiredDomains can be slow + may need login prompt
-        for _ in range(80):
+        for tick in range(80):      # 80 × 0.5s = 40 s
             await asyncio.sleep(0.5)
             try:
                 val = await page.evaluate(_EXPDOM_JS)
@@ -471,21 +514,30 @@ async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None)
                     break
             except Exception:
                 pass
+            if tick > 0 and tick % 10 == 0:
+                _log(SOURCE, f"  ... still waiting ({tick // 2}s elapsed)")
 
         if drop_text:
             dt = _parse_dt(drop_text)
             result.set_dt(dt, "ExpiredDomains.net detail page", "exact", drop_text)
+            _log(SOURCE, f"SUCCESS  Raw     : {drop_text}")
+            _log(SOURCE, f"         UTC     : {result.drop_dt_utc.strftime('%Y-%m-%d %H:%M UTC')}")
+            _log(SOURCE, f"         PST     : {result.drop_dt_pst.strftime('%Y-%m-%d %H:%M PST')}")
+            _log(SOURCE, f"         Source  : {result.source}")
         else:
             result.error = (
-                "ExpiredDomains.net: 'End Date' row not found. "
-                "Domain may not be listed, you may need to log in, "
+                "'End Date' row not found after 40s. "
+                "Domain may not be listed, login may be needed, "
                 "or the page structure changed."
             )
+            _log(SOURCE, f"ERROR  {result.error}")
 
     except ImportError:
         result.error = "nodriver not installed -- run: pip install nodriver"
+        _log(SOURCE, f"ERROR  {result.error}")
     except Exception as e:
-        result.error = f"ExpiredDomains.net error: {type(e).__name__}: {e}"
+        result.error = f"{type(e).__name__}: {e}"
+        _log(SOURCE, f"ERROR  {result.error}")
     finally:
         if browser is not None:
             try:
@@ -506,30 +558,31 @@ async def get_drop_time(
     browser_path: Optional[str] = None,
 ) -> DropResult:
     """
-    source='auto'           : Dynadot first, fall back to ExpiredDomains.net
+    source='auto'           : Dynadot first, fall back to ExpiredDomains
     source='dynadot'        : Dynadot only
-    source='expireddomains' : ExpiredDomains.net only
+    source='expireddomains' : ExpiredDomains only
     """
     domain = _normalize_domain(domain)
 
     if source == "dynadot":
+        _log("AUTO", f"Source forced: Dynadot  |  domain: {domain}")
         return await _fetch_dynadot(domain, browser_path)
     if source == "expireddomains":
+        _log("AUTO", f"Source forced: ExpiredDomains  |  domain: {domain}")
         return await _fetch_expireddomains(domain, browser_path)
 
-    print("    +- [1/2] Dynadot backorder page...", flush=True)
+    _log("AUTO", f"domain: {domain}  |  trying Dynadot first...")
     r = await _fetch_dynadot(domain, browser_path)
     if r.drop_dt_utc:
-        print("    +- success")
+        _log("AUTO", f"Final source used: {r.source}")
         return r
-    print(f"    |     x {r.error}")
+    _log("AUTO", f"Dynadot failed ({r.error}) -- falling back to ExpiredDomains...")
 
-    print("    +- [2/2] ExpiredDomains.net detail page...", flush=True)
     r2 = await _fetch_expireddomains(domain, browser_path)
     if r2.drop_dt_utc:
-        print("    +- success")
+        _log("AUTO", f"Final source used: {r2.source}")
         return r2
-    print(f"    |     x {r2.error}")
+    _log("AUTO", "Both sources failed.")
 
     r.error = f"Both sources failed. Dynadot: {r.error} | ExpiredDomains: {r2.error}"
     return r
@@ -547,6 +600,7 @@ async def _main() -> None:
         epilog=(
             "Examples:\n"
             "  python drop_time_scraper.py zenithpicks.com reviewindex.com\n"
+            "  python drop_time_scraper.py --source dynadot reviewindex.com\n"
             "  python drop_time_scraper.py --source expireddomains zenithpicks.com\n"
             '  python drop_time_scraper.py --browser-path "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" zenithpicks.com\n'
         ),
@@ -556,14 +610,18 @@ async def _main() -> None:
         "--source", "-s",
         choices=["auto", "dynadot", "expireddomains"],
         default="auto",
+        help="Which source to use (default: auto = Dynadot first, then ExpiredDomains)",
     )
-    parser.add_argument("--browser-path", "-b", metavar="PATH", default=None)
-    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--browser-path", "-b", metavar="PATH", default=None,
+                        help="Path to Chrome/Edge/Brave executable")
+    parser.add_argument("--json", action="store_true",
+                        help="Output results as JSON instead of human-readable text")
     args = parser.parse_args()
 
     results: list[DropResult] = []
     for domain in args.domains:
-        print(f"\nLooking up: {domain}")
+        _log("MAIN", f"{'='*54}")
+        _log("MAIN", f"Looking up: {domain}")
         r = await get_drop_time(domain, args.source, args.browser_path)
         results.append(r)
 
