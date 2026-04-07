@@ -195,24 +195,22 @@ class DropResult:
         self.drop_dt_utc = dt.astimezone(UTC)
         self.drop_dt_pst = dt.astimezone(PST)
 
-    def display(self) -> str:
-        icon = {"exact": "[EXACT]", "estimated": "[EST] ", "failed": "[FAIL]",
-                "unknown": "[ ?? ]"}.get(self.confidence, "[ ?? ]")
+    @property
+    def drop_date(self) -> Optional[str]:
+        """Return the drop date as a bare YYYY-MM-DD string, or None."""
         if self.drop_dt_utc:
-            utc_s = self.drop_dt_utc.strftime("%Y-%m-%d %H:%M UTC")
-            pst_s = self.drop_dt_pst.strftime("%Y-%m-%d %H:%M PST")  # type: ignore[union-attr]
-            return (
-                f"{icon}  {self.domain}\n"
-                f"   Drop Time  : {utc_s}  ({pst_s})\n"
-                f"   Confidence : {self.confidence.upper()}\n"
-                f"   Source     : {self.source}\n"
-                f"   Raw        : {self.raw_text or '-'}"
-            )
+            return self.drop_dt_utc.strftime("%Y-%m-%d")
+        return None
+
+    def display(self) -> str:
+        if self.drop_dt_utc:
+            return f"{self.domain}  {self.drop_date}"
         return f"[FAIL]  {self.domain}  --  {self.error}"
 
     def to_dict(self) -> dict:
         return {
             "domain":     self.domain,
+            "drop_date":  self.drop_date,
             "drop_utc":   self.drop_dt_utc.isoformat() if self.drop_dt_utc else None,
             "drop_pst":   self.drop_dt_pst.isoformat() if self.drop_dt_pst else None,
             "confidence": self.confidence,
@@ -356,10 +354,8 @@ async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> Dro
         if drop_text:
             dt = _parse_dt(drop_text)
             result.set_dt(dt, "Dynadot backorder page", "exact", drop_text)
-            _log(SOURCE, f"SUCCESS  Raw     : {drop_text}")
-            _log(SOURCE, f"         UTC     : {result.drop_dt_utc.strftime('%Y-%m-%d %H:%M UTC')}")
-            _log(SOURCE, f"         PST     : {result.drop_dt_pst.strftime('%Y-%m-%d %H:%M PST')}")
-            _log(SOURCE, f"         Source  : {result.source}")
+            # Print only the bare drop date
+            print(result.drop_date, flush=True)
         else:
             result.error = (
                 "'Drop Time' element not found after 30s. "
@@ -527,14 +523,11 @@ async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None)
                      f"rows so far: {labels}")
 
         if drop_text:
-            # Strip stray whitespace / newlines the DOM may inject
             drop_text = drop_text.strip()
             dt = _parse_dt(drop_text)
             result.set_dt(dt, f"ExpiredDomains.net ({drop_method})", "exact", drop_text)
-            _log(SOURCE, f"SUCCESS  Raw     : {drop_text}")
-            _log(SOURCE, f"         Method  : {drop_method}")
-            _log(SOURCE, f"         UTC     : {result.drop_dt_utc.strftime('%Y-%m-%d %H:%M UTC')}")
-            _log(SOURCE, f"         PST     : {result.drop_dt_pst.strftime('%Y-%m-%d %H:%M PST')}")
+            # Print only the bare drop date
+            print(result.drop_date, flush=True)
         else:
             rows_seen = [r[0] for r in last_rows]
             result.error = (
@@ -604,7 +597,7 @@ async def _main() -> None:
     global DEBUG
     parser = argparse.ArgumentParser(
         prog="drop_time_scraper",
-        description="Fetch exact drop time for pending-delete domains.",
+        description="Fetch exact drop date for pending-delete domains.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"

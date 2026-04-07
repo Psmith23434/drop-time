@@ -336,20 +336,19 @@ QLabel#badge_fail {{
 # DATA MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 
-COLS = ["Domain", "Drop Time (PST)", "Drop Time (UTC)", "Confidence", "Source", "Status"]
+# Single "Drop Date" column replaces the old PST + UTC pair
+COLS = ["Domain", "Drop Date", "Confidence", "Source", "Status"]
 COL_DOMAIN  = 0
-COL_PST     = 1
-COL_UTC     = 2
-COL_CONF    = 3
-COL_SOURCE  = 4
-COL_STATUS  = 5
+COL_DATE    = 1   # bare YYYY-MM-DD
+COL_CONF    = 2
+COL_SOURCE  = 3
+COL_STATUS  = 4
 
 
 class DomainRow:
     def __init__(self, domain: str):
         self.domain    = domain
-        self.pst       = ""
-        self.utc       = ""
+        self.date      = ""   # YYYY-MM-DD
         self.conf      = ""
         self.source    = ""
         self.status    = "Queued"   # Queued | Fetching | Done | Error
@@ -358,8 +357,7 @@ class DomainRow:
 
     def apply_result(self, r: DropResult) -> None:
         if r.drop_dt_utc:
-            self.pst    = r.drop_dt_pst.strftime("%Y-%m-%d  %H:%M PST")
-            self.utc    = r.drop_dt_utc.strftime("%Y-%m-%d  %H:%M UTC")
+            self.date   = r.drop_date or ""
             self.conf   = r.confidence.upper()
             self.source = r.source or ""
             self.raw    = r.raw_text or ""
@@ -389,19 +387,21 @@ class DomainTableModel(QAbstractTableModel):
 
         if role == Qt.DisplayRole:
             return [
-                row.domain, row.pst, row.utc, row.conf, row.source, row.status
+                row.domain, row.date, row.conf, row.source, row.status
             ][col]
 
         if role == Qt.ForegroundRole:
             if col == COL_STATUS:
                 return {
-                    "Done":    QColor(COL["success"]),
-                    "Error":   QColor(COL["error"]),
+                    "Done":     QColor(COL["success"]),
+                    "Error":    QColor(COL["error"]),
                     "Fetching": QColor(COL["accent_glow"]),
-                    "Queued":  QColor(COL["text_faint"]),
+                    "Queued":   QColor(COL["text_faint"]),
                 }.get(row.status, QColor(COL["text"]))
             if col == COL_CONF and row.conf == "EXACT":
                 return QColor(COL["success"])
+            if col == COL_DATE and row.date:
+                return QColor(COL["text"])   # bright white for the date
             if col == COL_DOMAIN:
                 return QColor(COL["text"])
             return QColor(COL["text_muted"])
@@ -411,7 +411,7 @@ class DomainTableModel(QAbstractTableModel):
             return base
 
         if role == Qt.TextAlignmentRole:
-            if col in (COL_PST, COL_UTC):
+            if col == COL_DATE:
                 return Qt.AlignCenter
             return Qt.AlignVCenter | Qt.AlignLeft
 
@@ -428,7 +428,6 @@ class DomainTableModel(QAbstractTableModel):
 
     def add_domain(self, domain: str) -> int:
         """Add a new row, return its index."""
-        # Deduplicate
         for i, r in enumerate(self._rows):
             if r.domain == domain:
                 return i
@@ -502,7 +501,7 @@ class LookupWorker(QObject):
                 self.result_ready.emit(idx, result)
                 if result.drop_dt_utc:
                     self.log_msg.emit(
-                        f"  ✓  {domain}  →  {result.drop_dt_pst.strftime('%Y-%m-%d %H:%M PST')}"
+                        f"  ✓  {domain}  →  {result.drop_date}"
                     )
                 else:
                     self.log_msg.emit(f"  ✗  {domain}  →  {result.error}")
@@ -542,7 +541,7 @@ class HeaderBar(QWidget):
         title_col.setSpacing(1)
         title = QLabel("Drop Time Sniper")
         title.setStyleSheet(f"color: {COL['text']}; font-size: 15px; font-weight: 700; background: transparent;")
-        sub = QLabel("Domain drop time lookup  ·  Dynadot + ExpiredDomains.net")
+        sub = QLabel("Domain drop date lookup  ·  Dynadot + ExpiredDomains.net")
         sub.setStyleSheet(f"color: {COL['text_muted']}; font-size: 11px; background: transparent;")
         title_col.addWidget(title)
         title_col.addWidget(sub)
@@ -622,7 +621,7 @@ class DropTimeWindow(QMainWindow):
         self._connect_signals()
         self._detect_browser()
 
-    # ── UI construction ────────────────────────────────────────────────────
+    # ── UI construction ───────────────────────────────────────────────────
 
     def _build_ui(self):
         self.setStyleSheet(STYLESHEET)
@@ -687,7 +686,7 @@ class DropTimeWindow(QMainWindow):
         self.btn_lookup = QPushButton("Look Up")
         self.btn_lookup.setObjectName("btnLookup")
         self.btn_lookup.setFixedHeight(38)
-        self.btn_lookup.setToolTip("Fetch drop times for all queued domains  (Enter)")
+        self.btn_lookup.setToolTip("Fetch drop dates for all queued domains  (Enter)")
         input_lay.addWidget(self.btn_lookup)
 
         content_lay.addWidget(input_card)
@@ -758,8 +757,7 @@ class DropTimeWindow(QMainWindow):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(COL_DOMAIN,  QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(COL_PST,     QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(COL_UTC,     QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(COL_DATE,    QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(COL_CONF,    QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(COL_SOURCE,  QHeaderView.Stretch)
         hh.setSectionResizeMode(COL_STATUS,  QHeaderView.ResizeToContents)
@@ -808,7 +806,7 @@ class DropTimeWindow(QMainWindow):
         )
         self._set_status("Ready")
 
-    # ── Signals ───────────────────────────────────────────────────────────
+    # ── Signals ────────────────────────────────────────────────────
 
     def _connect_signals(self):
         self.btn_lookup.clicked.connect(self._on_lookup)
@@ -933,16 +931,16 @@ class DropTimeWindow(QMainWindow):
             self._set_status("Nothing to export.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export CSV", "drop_times.csv", "CSV files (*.csv)"
+            self, "Export CSV", "drop_dates.csv", "CSV files (*.csv)"
         )
         if not path:
             return
         with open(path, "w", encoding="utf-8") as f:
-            f.write("domain,drop_pst,drop_utc,confidence,source,status,raw\n")
+            f.write("domain,drop_date,confidence,source,status,raw\n")
             for r in rows:
                 raw_esc = (r.raw or "").replace('"', '""')
                 f.write(
-                    f'"{r.domain}","{r.pst}","{r.utc}","{r.conf}",'
+                    f'"{r.domain}","{r.date}","{r.conf}",'
                     f'"{r.source}","{r.status}","{raw_esc}"\n'
                 )
         self._set_status(f"Exported {len(rows)} rows → {path}")
