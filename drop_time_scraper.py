@@ -59,6 +59,7 @@ import re
 import shutil
 import socket
 import sys
+import tempfile
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -254,19 +255,22 @@ def _parse_dynadot_dt(raw: str) -> datetime:
 
 async def _fetch_nodriver(domain: str, browser_path: Optional[str] = None) -> DropResult:
     """
-    Launches a real Chrome instance via nodriver with auto-detected binary.
-    nodriver strips all automation fingerprints so Cloudflare Managed Challenge
-    passes as a real browser visit.
+    Launches a real Chrome/Edge/Brave instance via nodriver with auto-detected binary.
+
+    nodriver.start() silently returns None when given a non-Chrome binary (Edge, Brave)
+    on some versions. We work around this by building the Config object directly and
+    calling Browser.create(), which is the stable low-level API.
     """
     result = DropResult(domain)
+    tmp_profile: Optional[str] = None
     try:
         import nodriver as uc  # pip install nodriver
 
         chrome_bin = _find_chrome_binary(browser_path)
         if not chrome_bin:
             result.error = (
-                "Chrome not found. Install Chrome, Edge, Brave, or Chromium, "
-                "or pass --browser-path \"C:\\path\\to\\chrome.exe\""
+                "Chrome/Edge/Brave not found. Install one of them, "
+                "or pass --browser-path \"C:\\path\\to\\browser.exe\""
             )
             return result
 
@@ -275,16 +279,35 @@ async def _fetch_nodriver(domain: str, browser_path: Optional[str] = None) -> Dr
             f"?rscbo=expireddomains"
         )
         print(f"      Using browser: {chrome_bin}", flush=True)
-        print("      Launching Chrome...", flush=True)
-        browser = await uc.start(
+        print("      Launching browser...", flush=True)
+
+        # Create a fresh temp profile so Edge/Brave don't hit single-instance locks
+        tmp_profile = tempfile.mkdtemp(prefix="uc_drop_")
+
+        # Build the Config object directly — avoids uc.start() returning None for
+        # non-Chrome binaries (Edge, Brave) on certain nodriver versions.
+        config = uc.Config(
             headless=True,
             browser_executable_path=chrome_bin,
+            user_data_dir=tmp_profile,
             browser_args=[
                 "--no-sandbox",
                 "--disable-gpu",
                 "--window-size=1280,900",
+                "--disable-extensions",
+                "--disable-dev-shm-usage",
             ],
         )
+        browser = await uc.Browser.create(config)
+
+        if browser is None:
+            result.error = (
+                "nodriver: Browser.create() returned None. "
+                "The browser binary may be incompatible. Try --browser-path to point "
+                "at a different Chrome/Chromium build."
+            )
+            return result
+
         page = await browser.get(url)
 
         # JS string uses raw string (r""") to avoid Python SyntaxWarning on \d etc.
@@ -320,7 +343,7 @@ async def _fetch_nodriver(domain: str, browser_path: Optional[str] = None) -> Dr
 
         if drop_text:
             dt = _parse_dynadot_dt(drop_text)
-            result.set_dt(dt, "nodriver / Chrome (Dynadot)", "exact", drop_text)
+            result.set_dt(dt, "nodriver / Browser (Dynadot)", "exact", drop_text)
         else:
             result.error = (
                 "nodriver: page loaded but drop-time element not found. "
@@ -331,6 +354,14 @@ async def _fetch_nodriver(domain: str, browser_path: Optional[str] = None) -> Dr
         result.error = "nodriver not installed -- run: pip install nodriver"
     except Exception as e:
         result.error = f"nodriver exception: {type(e).__name__}: {e}"
+    finally:
+        # Clean up temp profile
+        if tmp_profile and Path(tmp_profile).exists():
+            try:
+                shutil.rmtree(tmp_profile, ignore_errors=True)
+                print(f"      cleaned up temp profile {tmp_profile}", flush=True)
+            except Exception:
+                pass
     return result
 
 
@@ -466,10 +497,12 @@ def _fetch_rdap(domain: str) -> DropResult:
             drop_dt  = datetime(drop_day.year, drop_day.month, drop_day.day, hour, minute, 0, tzinfo=UTC)
             result.set_dt(
                 drop_dt,
-                "RDAP last-changed + TLD window (low accuracy -- last-changed != pendingDelete entry)",
+                "RDAP last-changed + TLD window  ⚠ LOW ACCURACY",
                 "estimated",
                 f"last-updated: {updated_dt.isoformat()} -> +{days}d ~{hour:02d}:{minute:02d} UTC  "
-                f"[WARNING: may be off by 1-3 days]",
+                f"[WARNING: Verisign does not expose pendingDelete date in RDAP. "
+                f"'last-changed' = registrar-delete timestamp, NOT pendingDelete entry. "
+                f"Actual drop may be 1-3 days later than shown. Use nodriver for exact time.]",
             )
 
         elif is_pending and expiry_dt:
