@@ -57,6 +57,12 @@ Usage:
   python drop_time_scraper.py --debug zenithpicks.com
   python drop_time_scraper.py --browser-path "C:\\path\\to\\msedge.exe" zenithpicks.com
 
+Stdout vs stderr:
+  stdout  -- bare YYYY-MM-DD dates only (one per domain, as soon as found)
+             plus the final summary lines.
+  stderr  -- all diagnostic / progress messages ([HH:MM:SS] [TAG] ...).
+             Redirect with  2>/dev/null  to silence completely.
+
 Notes on Edge + nodriver:
   - headless=False is used intentionally.  Cloudflare (Dynadot) and
     ExpiredDomains.net both detect --headless mode even with nodriver.
@@ -92,8 +98,9 @@ DEBUG = False
 # ---------------------------------------------------------------------------
 
 def _log(tag: str, msg: str) -> None:
+    """Diagnostic output -- always goes to stderr so stdout stays clean."""
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] [{tag}] {msg}", flush=True)
+    print(f"[{ts}] [{tag}] {msg}", file=sys.stderr, flush=True)
 
 def _dbg(tag: str, msg: str) -> None:
     if DEBUG:
@@ -354,7 +361,7 @@ async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> Dro
         if drop_text:
             dt = _parse_dt(drop_text)
             result.set_dt(dt, "Dynadot backorder page", "exact", drop_text)
-            # Print only the bare drop date
+            # Bare drop date to stdout -- the only stdout output for this domain
             print(result.drop_date, flush=True)
         else:
             result.error = (
@@ -526,7 +533,7 @@ async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None)
             drop_text = drop_text.strip()
             dt = _parse_dt(drop_text)
             result.set_dt(dt, f"ExpiredDomains.net ({drop_method})", "exact", drop_text)
-            # Print only the bare drop date
+            # Bare drop date to stdout -- the only stdout output for this domain
             print(result.drop_date, flush=True)
         else:
             rows_seen = [r[0] for r in last_rows]
@@ -606,6 +613,8 @@ async def _main() -> None:
             "  python drop_time_scraper.py --source expireddomains zenithpicks.com\n"
             "  python drop_time_scraper.py --debug zenithpicks.com\n"
             '  python drop_time_scraper.py --browser-path "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" zenithpicks.com\n'
+            "\nStdout is bare YYYY-MM-DD dates only.  Progress messages go to stderr.\n"
+            "Silence diagnostics with:  python drop_time_scraper.py domain.com 2>/dev/null\n"
         ),
     )
     parser.add_argument("domains", nargs="+", metavar="DOMAIN")
@@ -618,9 +627,9 @@ async def _main() -> None:
     parser.add_argument("--browser-path", "-b", metavar="PATH", default=None,
                         help="Path to Chrome/Edge/Brave executable")
     parser.add_argument("--json", action="store_true",
-                        help="Output results as JSON instead of human-readable text")
+                        help="Output results as JSON to stdout instead of bare dates")
     parser.add_argument("--debug", action="store_true",
-                        help="Print verified/endDateRow/rows on every poll tick")
+                        help="Print verified/endDateRow/rows on every poll tick (to stderr)")
     args = parser.parse_args()
     DEBUG = args.debug
 
@@ -631,13 +640,14 @@ async def _main() -> None:
         r = await get_drop_time(domain, args.source, args.browser_path)
         results.append(r)
 
-    print("\n" + "=" * 62)
+    # Final summary -- JSON goes to stdout; human summary goes to stderr
     if args.json:
         print(json.dumps([r.to_dict() for r in results], indent=2, default=str))
     else:
+        print("", file=sys.stderr)
+        print("=" * 62, file=sys.stderr)
         for r in results:
-            print(r.display())
-            print()
+            print(r.display(), file=sys.stderr)
 
 
 if __name__ == "__main__":
