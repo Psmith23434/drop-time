@@ -35,6 +35,7 @@ Usage:
   python drop_time_scraper.py --source dynadot zenithpicks.com
   python drop_time_scraper.py --source expireddomains zenithpicks.com
   python drop_time_scraper.py --json zenithpicks.com
+  python drop_time_scraper.py --debug zenithpicks.com
   python drop_time_scraper.py --browser-path "C:\\path\\to\\msedge.exe" zenithpicks.com
 
 Notes on Edge + nodriver:
@@ -63,15 +64,21 @@ from zoneinfo import ZoneInfo
 PST = ZoneInfo("America/Los_Angeles")
 UTC = timezone.utc
 
+# Global debug flag -- set by --debug CLI arg
+DEBUG = False
+
 
 # ---------------------------------------------------------------------------
-# Logging helpers  (source-tagged, timestamped)
+# Logging helpers
 # ---------------------------------------------------------------------------
 
 def _log(tag: str, msg: str) -> None:
-    """Print a timestamped, source-tagged log line to stdout."""
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] [{tag}] {msg}", flush=True)
+
+def _dbg(tag: str, msg: str) -> None:
+    if DEBUG:
+        _log(tag + "/DBG", msg)
 
 
 # ---------------------------------------------------------------------------
@@ -207,11 +214,6 @@ def _normalize_domain(domain: str) -> str:
 
 
 def _parse_dt(raw: str) -> datetime:
-    """
-    Parse drop-time strings from both sources.
-      Dynadot        : '2026/04/08 10:45 PST'
-      ExpiredDomains : '2026-04-08'  or  '2026-04-08 10:45:00 UTC'
-    """
     raw = raw.strip()
     m = re.search(
         r"(\d{4})[/\-](\d{2})[/\-](\d{2})"
@@ -235,16 +237,6 @@ def _parse_dt(raw: str) -> datetime:
 
 
 async def _make_browser(chrome_bin: str, profile_dir: str):
-    """
-    Launch a nodriver browser.
-
-    headless=False is intentional:
-      - Cloudflare (Dynadot) detects headless even with nodriver on Edge.
-      - ExpiredDomains.net also trips on headless.
-      - Window opens at 1x1 px (bottom-left corner) and closes when done.
-
-    Persistent profile: CF challenge cookies and ED login survive between runs.
-    """
     import nodriver as uc
     config = uc.Config(
         headless=False,
@@ -263,7 +255,6 @@ async def _make_browser(chrome_bin: str, profile_dir: str):
 
 
 async def _safe_get(browser, url: str, retries: int = 2):
-    """browser.get() on Edge can return None on the first call; retry."""
     for attempt in range(retries + 1):
         page = await browser.get(url)
         if page is not None:
@@ -274,18 +265,7 @@ async def _safe_get(browser, url: str, retries: int = 2):
 
 
 # ---------------------------------------------------------------------------
-# Source 1 -- Dynadot backorder page
-# ---------------------------------------------------------------------------
-#
-# Confirmed HTML:
-#   <div class="domain-info-text" data-v-5ee84fcc="">
-#     <span style="opacity:0.4;" data-v-5ee84fcc="">Drop Time:</span>
-#     <span style="font-size:24px;" data-v-5ee84fcc="">2026/04/08 10:45 PST</span>
-#   </div>
-#
-# The Vue data-v-* scoped attributes don't affect CSS class selectors.
-# We find every .domain-info-text container, look for the span labelled
-# 'Drop Time:' (spans[0]), and return the NEXT sibling span (spans[1]).
+# Source 1 -- Dynadot
 # ---------------------------------------------------------------------------
 
 _DYNADOT_JS = """
@@ -301,7 +281,6 @@ _DYNADOT_JS = """
             }
         }
     }
-    // Fallback: regex over body text
     var body = document.body ? (document.body.innerText || document.body.textContent || '') : '';
     var m = body.match(/(\\d{4}\\/\\d{2}\\/\\d{2}\\s+\\d{2}:\\d{2}\\s*(?:PST|PDT|UTC))/i);
     return m ? m[1].trim() : null;
@@ -310,14 +289,6 @@ _DYNADOT_JS = """
 
 
 async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> DropResult:
-    """
-    Loads https://www.dynadot.com/market/backorder/{domain}
-    and extracts the 'Drop Time' span value.
-
-    First-run note: Cloudflare shows a checkbox CAPTCHA.  Click it in the
-    browser window that opens.  The persistent profile caches the CF cookie
-    so subsequent runs skip the challenge entirely.
-    """
     SOURCE = "Dynadot"
     result = DropResult(domain)
     browser = None
@@ -326,9 +297,7 @@ async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> Dro
 
         chrome_bin = _find_chrome_binary(browser_path)
         if not chrome_bin:
-            result.error = (
-                "No browser found. Install Chrome/Edge/Brave or set CHROME_PATH."
-            )
+            result.error = "No browser found. Install Chrome/Edge/Brave or set CHROME_PATH."
             _log(SOURCE, f"ERROR  {result.error}")
             return result
 
@@ -336,8 +305,7 @@ async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> Dro
         _log(SOURCE, f"Profile  : {_profile_dir()}")
         _log(SOURCE, f"Fetching : https://www.dynadot.com/market/backorder/{domain}")
 
-        profile = str(_profile_dir())
-        browser = await _make_browser(chrome_bin, profile)
+        browser = await _make_browser(chrome_bin, str(_profile_dir()))
         if browser is None:
             result.error = "Browser.create() returned None."
             _log(SOURCE, f"ERROR  {result.error}")
@@ -354,7 +322,7 @@ async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> Dro
         _log(SOURCE, "  >> If a Cloudflare checkbox appears, click it in the browser window.")
 
         drop_text: Optional[str] = None
-        for tick in range(60):      # 60 × 0.5s = 30 s
+        for tick in range(60):
             await asyncio.sleep(0.5)
             try:
                 val = await page.evaluate(_DYNADOT_JS)
@@ -397,80 +365,69 @@ async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> Dro
 
 
 # ---------------------------------------------------------------------------
-# Source 2 -- ExpiredDomains.net per-domain detail page
+# Source 2 -- ExpiredDomains.net
 # ---------------------------------------------------------------------------
 #
-# Confirmed HTML (member.expireddomains.net/domain/{domain}):
+# ROOT CAUSE OF WRONG DATE (now fixed):
 #
-#   <table class="base1 small listing">
-#     <tbody>
-#       <tr><td>Added to List</td><td>2026-04-04</td></tr>   <- NOT this row
-#       <tr>
-#         <td>End Date</td>                                  <- match THIS label
-#         <td><a class="verified1">2026-04-08</a></td>       <- return this text
-#       </tr>
-#     </tbody>
-#   </table>
+#   The page renders in two stages:
+#     Stage 1 (fast): the table appears with only "Added to List: 2026-04-04"
+#     Stage 2 (slow): "End Date: 2026-04-08" row is injected by JS
 #
-# BUG THAT WAS FIXED:
-#   The old code used  label === 'End Date'  but innerText frequently has a
-#   trailing newline ("End Date\n"), causing the match to fail silently.
-#   The loop then fell through and the NEXT date found was "Added to List"
-#   -> "2026-04-04" (the wrong date).
+#   The old poller accepted the FIRST date-shaped string it found anywhere in
+#   table.base1.  Stage 1 arrived before Stage 2, so it returned "2026-04-04".
 #
-# Fix: explicitly trim() the label before comparing, AND use textContent as
-# fallback in case innerText is undefined (e.g. hidden elements).
+# FIX:
+#   The JS now returns a JSON object  { found: bool, date: str|null, debug: [...] }
+#   instead of a bare string.  It only sets  found=true  when the label of the
+#   matched row is EXACTLY "End Date" (after trim).  The Python poller ignores
+#   any result where found=false and keeps waiting.  This means it will wait
+#   through Stage 1 and only accept the date once Stage 2 has rendered.
+#
+#   The debug array lists every row found in table.base1 at the moment of the
+#   call -- visible with --debug flag.
 # ---------------------------------------------------------------------------
 
+# Returns JSON string: {"found": bool, "date": str|null, "rows": [[label,val],...]}
 _EXPDOM_JS = """
 (function() {
-    // Walk every row in any table.base1 on this page
+    var result = { found: false, date: null, rows: [] };
     var rows = document.querySelectorAll('table.base1 tr');
+
     for (var i = 0; i < rows.length; i++) {
         var cells = rows[i].querySelectorAll('td');
         if (cells.length < 2) continue;
 
-        // FIX: trim() both innerText and textContent before comparing.
-        // innerText can include trailing newlines; textContent is the fallback.
-        var label = '';
-        if (typeof cells[0].innerText !== 'undefined') {
-            label = cells[0].innerText.trim();
-        }
-        if (!label && typeof cells[0].textContent !== 'undefined') {
-            label = cells[0].textContent.trim();
-        }
+        var label = (cells[0].innerText || cells[0].textContent || '').trim();
+        var rawVal = (cells[1].innerText || cells[1].textContent || '').trim();
 
-        // Only match the 'End Date' row -- not 'Added to List' or any other row
+        // For the debug array: record every row we see
+        result.rows.push([label, rawVal.substring(0, 40)]);
+
+        // CRITICAL: only match the row explicitly labelled "End Date".
+        // Do NOT accept dates from "Added to List" or any other row.
         if (label !== 'End Date') continue;
 
-        // Prefer <a class="verified1"> -- its title says 'Date is most likely accurate'
+        // Prefer <a class="verified1"> text (title says "Date is most likely accurate")
         var link = cells[1].querySelector('a.verified1');
-        if (link) {
-            var linkText = '';
-            if (typeof link.innerText !== 'undefined') linkText = link.innerText.trim();
-            if (!linkText && typeof link.textContent !== 'undefined') linkText = link.textContent.trim();
-            if (linkText) return linkText;
-        }
+        var dateVal = link
+            ? (link.innerText || link.textContent || '').trim()
+            : rawVal;
 
-        // Fallback: plain cell text
-        var cellText = '';
-        if (typeof cells[1].innerText !== 'undefined') cellText = cells[1].innerText.trim();
-        if (!cellText && typeof cells[1].textContent !== 'undefined') cellText = cells[1].textContent.trim();
-        return cellText || null;
+        if (dateVal) {
+            result.found = true;
+            result.date  = dateVal;
+        }
+        // Stop after finding the End Date row regardless
+        break;
     }
-    return null;
+
+    return JSON.stringify(result);
 })()
 """
 
 
 async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None) -> DropResult:
-    """
-    Loads https://member.expireddomains.net/domain/{domain}
-    and reads the 'End Date' row (NOT 'Added to List') from table.base1.
-
-    Requires an ExpiredDomains.net login.  On first run the login page may
-    appear -- log in manually; the persistent profile keeps you signed in.
-    """
     SOURCE = "ExpiredDomains"
     result = DropResult(domain)
     browser = None
@@ -487,8 +444,7 @@ async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None)
         _log(SOURCE, f"Profile  : {_profile_dir()}")
         _log(SOURCE, f"Fetching : https://member.expireddomains.net/domain/{domain}")
 
-        profile = str(_profile_dir())
-        browser = await _make_browser(chrome_bin, profile)
+        browser = await _make_browser(chrome_bin, str(_profile_dir()))
         if browser is None:
             result.error = "Browser.create() returned None."
             _log(SOURCE, f"ERROR  {result.error}")
@@ -501,21 +457,36 @@ async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None)
             _log(SOURCE, f"ERROR  {result.error}")
             return result
 
-        _log(SOURCE, "Page loaded -- polling for 'End Date' row in table.base1 (max 40s)...")
+        _log(SOURCE, "Page loaded -- waiting for 'End Date' row in table.base1 (max 40s)...")
         _log(SOURCE, "  >> If the login page appears, sign in to ExpiredDomains.net.")
+        if DEBUG:
+            _dbg(SOURCE, "Run with --debug to see all table rows found each poll tick.")
 
         drop_text: Optional[str] = None
-        for tick in range(80):      # 80 × 0.5s = 40 s
+        last_debug_rows: list = []
+
+        for tick in range(80):      # 80 x 0.5s = 40s
             await asyncio.sleep(0.5)
             try:
-                val = await page.evaluate(_EXPDOM_JS)
-                if val and re.search(r"\d{4}[/\-]\d{2}[/\-]\d{2}", str(val)):
-                    drop_text = str(val).strip()
+                raw_json = await page.evaluate(_EXPDOM_JS)
+                if not raw_json:
+                    continue
+                data = json.loads(str(raw_json))
+                last_debug_rows = data.get("rows", [])
+
+                _dbg(SOURCE, f"tick={tick}  rows seen: {last_debug_rows}")
+
+                if data.get("found") and data.get("date"):
+                    drop_text = str(data["date"]).strip()
+                    _log(SOURCE, f"'End Date' row found at tick {tick} ({tick * 0.5:.1f}s)")
                     break
-            except Exception:
-                pass
+
+            except Exception as exc:
+                _dbg(SOURCE, f"tick={tick}  eval error: {exc}")
+
             if tick > 0 and tick % 10 == 0:
-                _log(SOURCE, f"  ... still waiting ({tick // 2}s elapsed)")
+                _log(SOURCE, f"  ... still waiting ({tick // 2}s elapsed)  "
+                             f"rows so far: {[r[0] for r in last_debug_rows]}")
 
         if drop_text:
             dt = _parse_dt(drop_text)
@@ -525,10 +496,12 @@ async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None)
             _log(SOURCE, f"         PST     : {result.drop_dt_pst.strftime('%Y-%m-%d %H:%M PST')}")
             _log(SOURCE, f"         Source  : {result.source}")
         else:
+            rows_seen = [r[0] for r in last_debug_rows]
             result.error = (
-                "'End Date' row not found after 40s. "
-                "Domain may not be listed, login may be needed, "
-                "or the page structure changed."
+                f"'End Date' row not found after 40s. "
+                f"Rows visible in table.base1: {rows_seen}. "
+                f"Domain may not be listed, login may be needed, "
+                f"or the page structure changed."
             )
             _log(SOURCE, f"ERROR  {result.error}")
 
@@ -557,11 +530,6 @@ async def get_drop_time(
     source: str = "auto",
     browser_path: Optional[str] = None,
 ) -> DropResult:
-    """
-    source='auto'           : Dynadot first, fall back to ExpiredDomains
-    source='dynadot'        : Dynadot only
-    source='expireddomains' : ExpiredDomains only
-    """
     domain = _normalize_domain(domain)
 
     if source == "dynadot":
@@ -593,6 +561,7 @@ async def get_drop_time(
 # ---------------------------------------------------------------------------
 
 async def _main() -> None:
+    global DEBUG
     parser = argparse.ArgumentParser(
         prog="drop_time_scraper",
         description="Fetch exact drop time for pending-delete domains.",
@@ -602,6 +571,7 @@ async def _main() -> None:
             "  python drop_time_scraper.py zenithpicks.com reviewindex.com\n"
             "  python drop_time_scraper.py --source dynadot reviewindex.com\n"
             "  python drop_time_scraper.py --source expireddomains zenithpicks.com\n"
+            "  python drop_time_scraper.py --debug zenithpicks.com\n"
             '  python drop_time_scraper.py --browser-path "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" zenithpicks.com\n'
         ),
     )
@@ -616,11 +586,14 @@ async def _main() -> None:
                         help="Path to Chrome/Edge/Brave executable")
     parser.add_argument("--json", action="store_true",
                         help="Output results as JSON instead of human-readable text")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print every table row seen per poll tick (diagnose wrong-date issues)")
     args = parser.parse_args()
+    DEBUG = args.debug
 
     results: list[DropResult] = []
     for domain in args.domains:
-        _log("MAIN", f"{'='*54}")
+        _log("MAIN", "=" * 54)
         _log("MAIN", f"Looking up: {domain}")
         r = await get_drop_time(domain, args.source, args.browser_path)
         results.append(r)
