@@ -21,9 +21,28 @@ Fetches the EXACT drop time for pending-delete domains from two sources:
                       <tr><td>Added to List</td><td>2026-04-04</td></tr>
                       <tr>
                         <td>End Date</td>
-                        <td><a class="verified1">2026-04-08</a></td>
+                        <td>
+                          <a class="verified1"
+                             title="Date is most likely accurate"
+                             href="...">2026-04-09</a>
+                        </td>
                       </tr>
                     </table>
+
+             Detection strategy (two-tier, fastest wins):
+
+               Tier 1 -- a.verified1  (fastest, most reliable)
+                 Any <a class="verified1"> anywhere on the page whose text
+                 looks like a date is unambiguously the registrar-confirmed
+                 end date.  ExpiredDomains only stamps this class on ONE
+                 element per page.  Accepted immediately as soon as the
+                 element is present in the DOM.
+
+               Tier 2 -- "End Date" row label  (fallback)
+                 If a.verified1 is absent (some domains show the date
+                 without the verified badge), fall back to scanning
+                 table.base1 rows for the label "End Date" exactly.
+
              Note : Requires an ExpiredDomains.net account.  Log in once in
                     the browser window that opens -- the persistent profile
                     keeps you logged in for future runs.
@@ -82,7 +101,7 @@ def _dbg(tag: str, msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Persistent browser profile  (survives CF challenges between runs)
+# Persistent browser profile
 # ---------------------------------------------------------------------------
 
 def _profile_dir() -> Path:
@@ -368,61 +387,66 @@ async def _fetch_dynadot(domain: str, browser_path: Optional[str] = None) -> Dro
 # Source 2 -- ExpiredDomains.net
 # ---------------------------------------------------------------------------
 #
-# ROOT CAUSE OF WRONG DATE (now fixed):
+# DETECTION STRATEGY -- two-tier, fastest wins:
 #
-#   The page renders in two stages:
-#     Stage 1 (fast): the table appears with only "Added to List: 2026-04-04"
-#     Stage 2 (slow): "End Date: 2026-04-08" row is injected by JS
+#   Tier 1  a.verified1  (primary)
+#   -------
+#   <a class="verified1" title="Date is most likely accurate">2026-04-09</a>
 #
-#   The old poller accepted the FIRST date-shaped string it found anywhere in
-#   table.base1.  Stage 1 arrived before Stage 2, so it returned "2026-04-04".
+#   ExpiredDomains stamps class="verified1" on exactly ONE anchor per page --
+#   the registrar-confirmed end date.  It is unambiguous: no label matching,
+#   no row-position assumptions.  As soon as this element appears in the DOM
+#   we accept its text and stop polling.  This is also faster than waiting for
+#   the full table to render because the verified anchor tends to be injected
+#   by the same XHR that populates the End Date row.
 #
-# FIX:
-#   The JS now returns a JSON object  { found: bool, date: str|null, debug: [...] }
-#   instead of a bare string.  It only sets  found=true  when the label of the
-#   matched row is EXACTLY "End Date" (after trim).  The Python poller ignores
-#   any result where found=false and keeps waiting.  This means it will wait
-#   through Stage 1 and only accept the date once Stage 2 has rendered.
+#   Tier 2  "End Date" row label  (fallback)
+#   -------
+#   If a.verified1 is absent (some domains show the plain date without the
+#   badge), we scan table.base1 rows for the label "End Date" (trimmed,
+#   exact match).  This was the previous strategy and is kept as a safety net.
 #
-#   The debug array lists every row found in table.base1 at the moment of the
-#   call -- visible with --debug flag.
+#   PREVIOUS BUG (now fixed by Tier 1):
+#   The page renders in two DOM stages:
+#     Stage 1 (fast): table appears with only "Added to List: 2026-04-04"
+#     Stage 2 (slow): "End Date / a.verified1" row injected by a second XHR
+#   Old code accepted the first date-shaped string in table.base1 -- always
+#   the wrong "Added to List" date from Stage 1.
+#   Tier 1 is immune: a.verified1 does not exist until Stage 2 completes.
 # ---------------------------------------------------------------------------
 
-# Returns JSON string: {"found": bool, "date": str|null, "rows": [[label,val],...]}
+# Returns JSON: { verified: str|null, endDateRow: str|null, rows: [[label,val],...] }
 _EXPDOM_JS = """
 (function() {
-    var result = { found: false, date: null, rows: [] };
-    var rows = document.querySelectorAll('table.base1 tr');
+    var out = { verified: null, endDateRow: null, rows: [] };
 
+    // --- Tier 1: a.verified1 anywhere on the page -----------------------
+    // title="Date is most likely accurate" -- unambiguous registrar date.
+    // No row-label matching needed; ED uses this class on exactly one anchor.
+    var links = document.querySelectorAll('a.verified1');
+    for (var v = 0; v < links.length; v++) {
+        var txt = (links[v].innerText || links[v].textContent || '').trim();
+        // Must look like a date (YYYY-MM-DD or YYYY/MM/DD)
+        if (/\\d{4}[\\/-]\\d{2}[\\/-]\\d{2}/.test(txt)) {
+            out.verified = txt;
+            break;   // only one per page -- no need to keep scanning
+        }
+    }
+
+    // --- Tier 2: End Date row in table.base1 (fallback) -----------------
+    var rows = document.querySelectorAll('table.base1 tr');
     for (var i = 0; i < rows.length; i++) {
         var cells = rows[i].querySelectorAll('td');
         if (cells.length < 2) continue;
-
-        var label = (cells[0].innerText || cells[0].textContent || '').trim();
+        var label  = (cells[0].innerText || cells[0].textContent || '').trim();
         var rawVal = (cells[1].innerText || cells[1].textContent || '').trim();
-
-        // For the debug array: record every row we see
-        result.rows.push([label, rawVal.substring(0, 40)]);
-
-        // CRITICAL: only match the row explicitly labelled "End Date".
-        // Do NOT accept dates from "Added to List" or any other row.
-        if (label !== 'End Date') continue;
-
-        // Prefer <a class="verified1"> text (title says "Date is most likely accurate")
-        var link = cells[1].querySelector('a.verified1');
-        var dateVal = link
-            ? (link.innerText || link.textContent || '').trim()
-            : rawVal;
-
-        if (dateVal) {
-            result.found = true;
-            result.date  = dateVal;
+        out.rows.push([label, rawVal.substring(0, 40)]);
+        if (label === 'End Date' && rawVal) {
+            out.endDateRow = rawVal;
         }
-        // Stop after finding the End Date row regardless
-        break;
     }
 
-    return JSON.stringify(result);
+    return JSON.stringify(out);
 })()
 """
 
@@ -457,13 +481,12 @@ async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None)
             _log(SOURCE, f"ERROR  {result.error}")
             return result
 
-        _log(SOURCE, "Page loaded -- waiting for 'End Date' row in table.base1 (max 40s)...")
+        _log(SOURCE, "Page loaded -- waiting for a.verified1 or 'End Date' row (max 40s)...")
         _log(SOURCE, "  >> If the login page appears, sign in to ExpiredDomains.net.")
-        if DEBUG:
-            _dbg(SOURCE, "Run with --debug to see all table rows found each poll tick.")
 
-        drop_text: Optional[str] = None
-        last_debug_rows: list = []
+        drop_text  : Optional[str] = None
+        drop_method: str           = "unknown"
+        last_rows  : list          = []
 
         for tick in range(80):      # 80 x 0.5s = 40s
             await asyncio.sleep(0.5)
@@ -472,33 +495,50 @@ async def _fetch_expireddomains(domain: str, browser_path: Optional[str] = None)
                 if not raw_json:
                     continue
                 data = json.loads(str(raw_json))
-                last_debug_rows = data.get("rows", [])
+                last_rows = data.get("rows", [])
 
-                _dbg(SOURCE, f"tick={tick}  rows seen: {last_debug_rows}")
+                _dbg(SOURCE,
+                     f"tick={tick}  "
+                     f"verified={data.get('verified')!r}  "
+                     f"endDateRow={data.get('endDateRow')!r}  "
+                     f"rows={last_rows}")
 
-                if data.get("found") and data.get("date"):
-                    drop_text = str(data["date"]).strip()
-                    _log(SOURCE, f"'End Date' row found at tick {tick} ({tick * 0.5:.1f}s)")
+                # Tier 1: a.verified1 -- registrar-confirmed, accept immediately
+                if data.get("verified"):
+                    drop_text   = data["verified"]
+                    drop_method = "a.verified1 (registrar-confirmed)"
+                    _log(SOURCE, f"Tier-1 hit: a.verified1 found at tick {tick} ({tick * 0.5:.1f}s)")
+                    break
+
+                # Tier 2: "End Date" row label -- plain date without verified badge
+                if data.get("endDateRow"):
+                    drop_text   = data["endDateRow"]
+                    drop_method = "'End Date' row label (fallback)"
+                    _log(SOURCE, f"Tier-2 hit: End Date row found at tick {tick} ({tick * 0.5:.1f}s)")
                     break
 
             except Exception as exc:
                 _dbg(SOURCE, f"tick={tick}  eval error: {exc}")
 
             if tick > 0 and tick % 10 == 0:
-                _log(SOURCE, f"  ... still waiting ({tick // 2}s elapsed)  "
-                             f"rows so far: {[r[0] for r in last_debug_rows]}")
+                labels = [r[0] for r in last_rows]
+                _log(SOURCE,
+                     f"  ... still waiting ({tick // 2}s elapsed)  "
+                     f"rows so far: {labels}")
 
         if drop_text:
+            # Strip stray whitespace / newlines the DOM may inject
+            drop_text = drop_text.strip()
             dt = _parse_dt(drop_text)
-            result.set_dt(dt, "ExpiredDomains.net detail page", "exact", drop_text)
+            result.set_dt(dt, f"ExpiredDomains.net ({drop_method})", "exact", drop_text)
             _log(SOURCE, f"SUCCESS  Raw     : {drop_text}")
+            _log(SOURCE, f"         Method  : {drop_method}")
             _log(SOURCE, f"         UTC     : {result.drop_dt_utc.strftime('%Y-%m-%d %H:%M UTC')}")
             _log(SOURCE, f"         PST     : {result.drop_dt_pst.strftime('%Y-%m-%d %H:%M PST')}")
-            _log(SOURCE, f"         Source  : {result.source}")
         else:
-            rows_seen = [r[0] for r in last_debug_rows]
+            rows_seen = [r[0] for r in last_rows]
             result.error = (
-                f"'End Date' row not found after 40s. "
+                f"Neither a.verified1 nor 'End Date' row found after 40s. "
                 f"Rows visible in table.base1: {rows_seen}. "
                 f"Domain may not be listed, login may be needed, "
                 f"or the page structure changed."
@@ -587,7 +627,7 @@ async def _main() -> None:
     parser.add_argument("--json", action="store_true",
                         help="Output results as JSON instead of human-readable text")
     parser.add_argument("--debug", action="store_true",
-                        help="Print every table row seen per poll tick (diagnose wrong-date issues)")
+                        help="Print verified/endDateRow/rows on every poll tick")
     args = parser.parse_args()
     DEBUG = args.debug
 
