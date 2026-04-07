@@ -5,23 +5,27 @@ drop_time_scraper.py
 Fetches the exact drop time for pending-delete .com/.net/etc. domains.
 Tries multiple techniques in order of reliability:
 
-  Technique 1 — nodriver   : Undetected Chrome, solves Cloudflare Turnstile,
+  Technique 1 - nodriver   : Undetected Chrome, solves Cloudflare Turnstile,
                               reads the EXACT drop time from Dynadot backorder page.
                               Requires: pip install nodriver
-                              Requires: Google Chrome installed on the machine.
+                              Requires: Google Chrome / Chromium / Edge / Brave installed.
+                              Pass --browser-path "C:\\path\\to\\chrome.exe" if not default.
 
-  Technique 2 — curl-cffi  : TLS/JA3 fingerprint impersonation (Chrome 124).
+  Technique 2 - curl-cffi  : TLS/JA3 fingerprint impersonation (Chrome 124).
                               Fast, no browser needed. Works IF Cloudflare is
-                              ever relaxed. Currently still blocked by CF Managed
-                              Challenge on Dynadot — included for future use.
+                              ever relaxed. Currently blocked by CF Managed
+                              Challenge on Dynadot - included for future use.
                               Requires: pip install curl-cffi
 
-  Technique 3 — RDAP        : IANA public RDAP API, no auth, no cost.
+  Technique 3 - RDAP        : IANA public RDAP API, no auth, no cost.
                               Finds the pendingDelete entry date then adds the
                               TLD-specific drop window offset.
                               Confidence: ESTIMATED (no library needed).
+                              NOTE: accuracy depends on registry publishing the
+                              pendingDelete event date. Falls back to last-changed
+                              date if not available, which reduces accuracy.
 
-  Technique 4 — WHOIS       : Raw socket WHOIS query, no library needed.
+  Technique 4 - WHOIS       : Raw socket WHOIS query, no library needed.
                               Reads Updated Date and adds TLD drop window offset.
                               Confidence: ESTIMATED (~+-12h accuracy).
 
@@ -30,33 +34,44 @@ Usage:
   python drop_time_scraper.py --technique rdap zenithpicks.com
   python drop_time_scraper.py --technique whois zenithpicks.com
   python drop_time_scraper.py --json zenithpicks.com
+  python drop_time_scraper.py --browser-path "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" zenithpicks.com
 
 Install only what you need:
   pip install nodriver           # Technique 1 (best accuracy)
-  pip install curl-cffi          # Technique 2 (fast, currently blocked)
+  pip install curl-cffi          # Technique 2 (fast, currently blocked on Dynadot)
   # Techniques 3 & 4 require only Python stdlib
+
+Chrome binary auto-detection order (Technique 1):
+  1. --browser-path CLI argument
+  2. CHROME_PATH environment variable
+  3. Common Windows paths (Chrome, Edge, Brave, Chromium)
+  4. Common macOS paths
+  5. Common Linux paths
+  6. PATH lookup (google-chrome, chromium-browser, microsoft-edge, brave-browser)
 """
 
 from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
+import shutil
 import socket
 import sys
 import urllib.request
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 
-# ─── TLD drop window table ────────────────────────────────────────────────────
+# --- TLD drop window table ---------------------------------------------------
 # (pending_delete_days, typical_drop_hour_utc, typical_drop_minute_utc)
-# Source: registry-published schedules + community observation
 TLD_DROP_WINDOWS: dict[str, tuple[int, int, int]] = {
-    "com":  (5, 15, 30),   # Verisign batch ~15:00-16:00 UTC
+    "com":  (5, 15, 30),
     "net":  (5, 15, 30),
-    "org":  (5, 16,  0),   # PIR / Afilias
+    "org":  (5, 16,  0),
     "info": (5, 16,  0),
     "biz":  (5, 16,  0),
     "co":   (5, 18,  0),
@@ -81,13 +96,81 @@ WHOIS_SERVERS: dict[str, str] = {
     "us":   "whois.nic.us",
 }
 
+# Common Chrome-family binary paths per OS
+CHROME_PATHS_WINDOWS = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files\Chromium\Application\chrome.exe",
+    r"C:\Program Files (x86)\Chromium\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+    r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+]
+CHROME_PATHS_MAC = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+]
+CHROME_PATHS_LINUX = [
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/usr/bin/microsoft-edge",
+    "/usr/bin/brave-browser",
+    "/snap/bin/chromium",
+]
+CHROME_PATH_CMDS = [
+    "google-chrome", "google-chrome-stable",
+    "chromium-browser", "chromium",
+    "microsoft-edge", "brave-browser",
+]
+
 PST = ZoneInfo("America/Los_Angeles")
 UTC = timezone.utc
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Chrome binary auto-detection
+# =============================================================================
+
+def _find_chrome_binary(user_path: Optional[str] = None) -> Optional[str]:
+    """
+    Returns path to a usable Chrome-family binary, or None if not found.
+    Search order:
+      1. user_path argument (--browser-path CLI flag)
+      2. CHROME_PATH environment variable
+      3. OS-specific common install paths
+      4. PATH lookup for known binary names
+    """
+    for candidate in [user_path, os.environ.get("CHROME_PATH")]:
+        if candidate and Path(candidate).is_file():
+            return candidate
+
+    if sys.platform == "win32":
+        paths = CHROME_PATHS_WINDOWS
+    elif sys.platform == "darwin":
+        paths = CHROME_PATHS_MAC
+    else:
+        paths = CHROME_PATHS_LINUX
+
+    for p in paths:
+        if Path(p).is_file():
+            return p
+
+    for cmd in CHROME_PATH_CMDS:
+        found = shutil.which(cmd)
+        if found:
+            return found
+
+    return None
+
+
+# =============================================================================
 # Result object
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 class DropResult:
     def __init__(self, domain: str):
@@ -96,7 +179,7 @@ class DropResult:
         self.drop_dt_pst  : Optional[datetime] = None
         self.raw_text     : Optional[str]       = None
         self.technique    : Optional[str]       = None
-        self.confidence   : str                = "unknown"  # exact | estimated | failed
+        self.confidence   : str                = "unknown"
         self.error        : Optional[str]       = None
 
     def set_dt(self, dt: datetime, technique: str, confidence: str, raw: str = "") -> None:
@@ -109,7 +192,7 @@ class DropResult:
         self.drop_dt_pst = dt.astimezone(PST)
 
     def display(self) -> str:
-        icon = {"exact": "🟢", "estimated": "🟡", "failed": "🔴"}.get(self.confidence, "⚪")
+        icon = {"exact": "[EXACT]", "estimated": "[EST] ", "failed": "[FAIL]"}.get(self.confidence, "[ ?? ]")
         if self.drop_dt_utc:
             utc_s = self.drop_dt_utc.strftime("%Y-%m-%d %H:%M UTC")
             pst_s = self.drop_dt_pst.strftime("%Y-%m-%d %H:%M PST")
@@ -120,7 +203,7 @@ class DropResult:
                 f"   Technique  : {self.technique}\n"
                 f"   Raw source : {self.raw_text or '-'}"
             )
-        return f"🔴  {self.domain}  —  FAILED: {self.error}"
+        return f"[FAIL]  {self.domain}  --  FAILED: {self.error}"
 
     def to_dict(self) -> dict:
         return {
@@ -134,9 +217,9 @@ class DropResult:
         }
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Shared helper
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Shared helpers
+# =============================================================================
 
 def _normalize_domain(domain: str) -> str:
     domain = domain.lower().strip()
@@ -165,31 +248,37 @@ def _parse_dynadot_dt(raw: str) -> datetime:
     return datetime(Y, Mo, D, h, mi, 0, tzinfo=tz_map.get(tz_str, UTC))
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Technique 1 — nodriver (real undetected Chrome, solves CF Turnstile)
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Technique 1 - nodriver (real undetected Chrome, solves CF Turnstile)
+# =============================================================================
 
-async def _fetch_nodriver(domain: str) -> DropResult:
+async def _fetch_nodriver(domain: str, browser_path: Optional[str] = None) -> DropResult:
     """
-    Launches a real Chrome instance via nodriver.
-    nodriver patches Chrome to avoid headless detection fingerprints
-    (navigator.webdriver, CDP exposure, etc.) and can solve Cloudflare
-    Managed Challenge by simply running JS like a real browser.
-
-    After CF clears, waits for Vue/Nuxt to hydrate the .domain-info-text
-    component and reads the drop-time span directly from the live DOM.
+    Launches a real Chrome instance via nodriver with auto-detected binary.
+    nodriver strips all automation fingerprints so Cloudflare Managed Challenge
+    passes as a real browser visit.
     """
     result = DropResult(domain)
     try:
         import nodriver as uc  # pip install nodriver
 
+        chrome_bin = _find_chrome_binary(browser_path)
+        if not chrome_bin:
+            result.error = (
+                "Chrome not found. Install Chrome, Edge, Brave, or Chromium, "
+                "or pass --browser-path \"C:\\path\\to\\chrome.exe\""
+            )
+            return result
+
         url = (
             f"https://www.dynadot.com/market/backorder/{domain}"
             f"?rscbo=expireddomains"
         )
-        print("      Launching Chrome…", flush=True)
+        print(f"      Using browser: {chrome_bin}", flush=True)
+        print("      Launching Chrome...", flush=True)
         browser = await uc.start(
             headless=True,
+            browser_executable_path=chrome_bin,
             browser_args=[
                 "--no-sandbox",
                 "--disable-gpu",
@@ -198,28 +287,29 @@ async def _fetch_nodriver(domain: str) -> DropResult:
         )
         page = await browser.get(url)
 
-        # Poll up to 30s for Vue hydration + CF challenge to clear
+        # JS string uses raw string (r""") to avoid Python SyntaxWarning on \d etc.
+        JS_EXTRACT = r"""
+            (() => {
+                const divs = document.querySelectorAll('.domain-info-text');
+                for (const div of divs) {
+                    const spans = div.querySelectorAll('span');
+                    for (let i = 0; i < spans.length; i++) {
+                        if (spans[i].innerText.includes('Drop Time') && spans[i+1]) {
+                            return spans[i+1].innerText.trim();
+                        }
+                    }
+                }
+                const body = document.body.innerText;
+                const m = body.match(/(\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}\s*(?:PST|PDT|UTC))/);
+                return m ? m[1] : null;
+            })()
+        """
+
         drop_text: Optional[str] = None
-        for attempt in range(60):
+        for attempt in range(60):  # poll up to 30s
             await asyncio.sleep(0.5)
             try:
-                js_result = await page.evaluate("""
-                    (() => {
-                        const divs = document.querySelectorAll('.domain-info-text');
-                        for (const div of divs) {
-                            const spans = div.querySelectorAll('span');
-                            for (let i = 0; i < spans.length; i++) {
-                                if (spans[i].innerText.includes('Drop Time') && spans[i+1]) {
-                                    return spans[i+1].innerText.trim();
-                                }
-                            }
-                        }
-                        // Strategy B: look for date-like pattern anywhere on page
-                        const body = document.body.innerText;
-                        const m = body.match(/(\d{4}\/\d{2}\/\d{2}\s+\d{2}:\d{2}\s*(?:PST|PDT|UTC))/);
-                        return m ? m[1] : null;
-                    })()
-                """)
+                js_result = await page.evaluate(JS_EXTRACT)
                 if js_result and re.search(r"\d{4}[/\-]\d{2}[/\-]\d{2}", js_result):
                     drop_text = js_result
                     break
@@ -233,31 +323,26 @@ async def _fetch_nodriver(domain: str) -> DropResult:
             result.set_dt(dt, "nodriver / Chrome (Dynadot)", "exact", drop_text)
         else:
             result.error = (
-                "nodriver: Chrome loaded the page but the drop-time element was not found. "
+                "nodriver: page loaded but drop-time element not found. "
                 "Dynadot may have changed their DOM structure."
             )
 
     except ImportError:
-        result.error = "nodriver not installed — run: pip install nodriver"
+        result.error = "nodriver not installed -- run: pip install nodriver"
     except Exception as e:
         result.error = f"nodriver exception: {type(e).__name__}: {e}"
     return result
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Technique 2 — curl-cffi (TLS/JA3 impersonation, Chrome 124 fingerprint)
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Technique 2 - curl-cffi (TLS/JA3 impersonation, Chrome 124 fingerprint)
+# =============================================================================
 
 def _fetch_curl_cffi(domain: str) -> DropResult:
     """
-    Uses curl-cffi to send an HTTP request with a byte-perfect Chrome 124
-    TLS ClientHello + HTTP/2 SETTINGS frames, bypassing passive bot detection.
-
-    Dynadot currently deploys Cloudflare Managed Challenge, which requires
-    actual JS execution. This technique is blocked TODAY but included because:
-    - Dynadot sometimes rotates CF security levels
-    - It is the correct first step before nodriver in a lighter-weight pipeline
-    - It works immediately if Dynadot ever drops to CF Bot Fight Mode (no JS challenge)
+    Chrome 124 TLS fingerprint impersonation.
+    Blocked by Dynadot's Cloudflare Managed Challenge today (requires JS execution).
+    Included for future use / other registrar sites.
     """
     result = DropResult(domain)
     try:
@@ -276,22 +361,12 @@ def _fetch_curl_cffi(domain: str) -> DropResult:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.expireddomains.net/",
-            "Sec-Fetch-Site": "cross-site",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-User": "?1",
-            "Sec-Fetch-Dest": "document",
         }
-        resp = cffi_req.get(
-            url,
-            headers=headers,
-            impersonate="chrome124",
-            timeout=20,
-            allow_redirects=True,
-        )
+        resp = cffi_req.get(url, headers=headers, impersonate="chrome124", timeout=20, allow_redirects=True)
 
         if resp.status_code == 403 or "Just a moment" in resp.text:
             result.error = (
-                "curl-cffi: Cloudflare Managed Challenge active — "
+                "curl-cffi: Cloudflare Managed Challenge active -- "
                 "JS execution required. Use nodriver instead."
             )
             return result
@@ -299,78 +374,72 @@ def _fetch_curl_cffi(domain: str) -> DropResult:
         html = resp.text
         nuxt_m = re.search(r'"dropTime"\s*:\s*"([^"]+)"', html)
         if nuxt_m:
-            drop_text = nuxt_m.group(1)
-            dt = _parse_dynadot_dt(drop_text)
-            result.set_dt(dt, "curl-cffi / TLS impersonation (Dynadot)", "exact", drop_text)
+            dt = _parse_dynadot_dt(nuxt_m.group(1))
+            result.set_dt(dt, "curl-cffi / TLS impersonation (Dynadot)", "exact", nuxt_m.group(1))
             return result
 
         raw_m = re.search(r"(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}\s*(?:PST|PDT|UTC|GMT))", html)
         if raw_m:
-            drop_text = raw_m.group(1)
-            dt = _parse_dynadot_dt(drop_text)
-            result.set_dt(dt, "curl-cffi / TLS impersonation (Dynadot)", "exact", drop_text)
+            dt = _parse_dynadot_dt(raw_m.group(1))
+            result.set_dt(dt, "curl-cffi / TLS impersonation (Dynadot)", "exact", raw_m.group(1))
         else:
-            result.error = (
-                "curl-cffi: bypassed CF but drop time not in HTML "
-                "(SPA not server-rendered for this route)"
-            )
+            result.error = "curl-cffi: bypassed CF but drop time not in HTML (SPA not server-rendered)"
 
     except ImportError:
-        result.error = "curl-cffi not installed — run: pip install curl-cffi"
+        result.error = "curl-cffi not installed -- run: pip install curl-cffi"
     except Exception as e:
         result.error = f"curl-cffi exception: {type(e).__name__}: {e}"
     return result
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Technique 3 — RDAP (IANA public API, no auth, estimated result)
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Technique 3 - RDAP (IANA public API, estimated result)
+# =============================================================================
 
 def _fetch_rdap(domain: str) -> DropResult:
     """
-    Two-step RDAP query:
-      1. IANA RDAP DNS bootstrap → find authoritative RDAP server for TLD
-      2. Query that server for domain data → extract pendingDelete event date
-    Then adds TLD-specific drop window offset to produce the estimated drop time.
-    No external libraries needed (pure stdlib urllib).
+    IANA RDAP bootstrap -> authoritative RDAP server -> pendingDelete event date.
+
+    ACCURACY NOTE:
+    Verisign (.com/.net) does NOT publish a dedicated pendingDelete event in RDAP.
+    Only 'last changed' is available, which is when the registrar submitted the
+    delete -- not when pendingDelete officially started. This means the estimate
+    can be off by 1-3 days. For exact times, use nodriver (Technique 1).
     """
     result = DropResult(domain)
     try:
         tld = domain.rsplit(".", 1)[-1].lower()
 
-        bootstrap_url = "https://data.iana.org/rdap/dns.json"
-        with urllib.request.urlopen(bootstrap_url, timeout=10) as r:
+        with urllib.request.urlopen("https://data.iana.org/rdap/dns.json", timeout=10) as r:
             bootstrap = json.loads(r.read())
 
         rdap_base: Optional[str] = None
         for entry in bootstrap.get("services", []):
-            tlds_list, urls_list = entry[0], entry[1]
-            if tld in [t.lower() for t in tlds_list]:
-                rdap_base = urls_list[0].rstrip("/")
+            if tld in [t.lower() for t in entry[0]]:
+                rdap_base = entry[1][0].rstrip("/")
                 break
 
         if not rdap_base:
             result.error = f"RDAP: no server registered for .{tld} in IANA bootstrap"
             return result
 
-        rdap_url = f"{rdap_base}/domain/{domain}"
         req = urllib.request.Request(
-            rdap_url,
+            f"{rdap_base}/domain/{domain}",
             headers={"Accept": "application/rdap+json, application/json"},
         )
         with urllib.request.urlopen(req, timeout=12) as r:
             data = json.loads(r.read())
 
-        status  = [s.lower() for s in data.get("status", [])]
-        events  = data.get("events", [])
+        status     = [s.lower() for s in data.get("status", [])]
+        is_pending = any("pending" in s for s in status)
 
         pending_dt: Optional[datetime] = None
         expiry_dt:  Optional[datetime] = None
         updated_dt: Optional[datetime] = None
 
-        for ev in events:
-            action  = ev.get("eventAction", "").lower()
-            raw_dt  = ev.get("eventDate", "")
+        for ev in data.get("events", []):
+            action = ev.get("eventAction", "").lower()
+            raw_dt = ev.get("eventDate", "")
             if not raw_dt:
                 continue
             try:
@@ -384,73 +453,54 @@ def _fetch_rdap(domain: str) -> DropResult:
             elif action in ("last changed", "last update", "updated"):
                 updated_dt = dt_parsed
 
-        is_pending = any("pending" in s for s in status)
+        days, hour, minute = TLD_DROP_WINDOWS.get(tld, DEFAULT_DROP_WINDOW)
 
         if pending_dt:
-            days, hour, minute = TLD_DROP_WINDOWS.get(tld, DEFAULT_DROP_WINDOW)
             drop_day = (pending_dt + timedelta(days=days)).date()
-            drop_dt  = datetime(drop_day.year, drop_day.month, drop_day.day,
-                                hour, minute, 0, tzinfo=UTC)
-            raw_s = (
-                f"RDAP pendingDelete entered: {pending_dt.isoformat()} "
-                f"→ +{days}d ~{hour:02d}:{minute:02d} UTC"
-            )
-            result.set_dt(drop_dt, "RDAP pendingDelete event + TLD window", "estimated", raw_s)
+            drop_dt  = datetime(drop_day.year, drop_day.month, drop_day.day, hour, minute, 0, tzinfo=UTC)
+            result.set_dt(drop_dt, "RDAP pendingDelete event + TLD window", "estimated",
+                          f"pendingDelete entered: {pending_dt.isoformat()} -> +{days}d ~{hour:02d}:{minute:02d} UTC")
 
         elif is_pending and updated_dt:
-            days, hour, minute = TLD_DROP_WINDOWS.get(tld, DEFAULT_DROP_WINDOW)
             drop_day = (updated_dt + timedelta(days=days)).date()
-            drop_dt  = datetime(drop_day.year, drop_day.month, drop_day.day,
-                                hour, minute, 0, tzinfo=UTC)
-            raw_s = (
-                f"RDAP last-updated (status=pendingDelete): {updated_dt.isoformat()} "
-                f"→ +{days}d ~{hour:02d}:{minute:02d} UTC"
+            drop_dt  = datetime(drop_day.year, drop_day.month, drop_day.day, hour, minute, 0, tzinfo=UTC)
+            result.set_dt(
+                drop_dt,
+                "RDAP last-changed + TLD window (low accuracy -- last-changed != pendingDelete entry)",
+                "estimated",
+                f"last-updated: {updated_dt.isoformat()} -> +{days}d ~{hour:02d}:{minute:02d} UTC  "
+                f"[WARNING: may be off by 1-3 days]",
             )
-            result.set_dt(drop_dt, "RDAP last-changed + TLD window", "estimated", raw_s)
 
         elif is_pending and expiry_dt:
-            days, hour, minute = TLD_DROP_WINDOWS.get(tld, DEFAULT_DROP_WINDOW)
             pending_start = expiry_dt + timedelta(days=35)
             drop_day      = (pending_start + timedelta(days=days)).date()
-            drop_dt       = datetime(drop_day.year, drop_day.month, drop_day.day,
-                                     hour, minute, 0, tzinfo=UTC)
-            raw_s = (
-                f"RDAP expiry: {expiry_dt.isoformat()} "
-                f"→ +35d redemption → +{days}d drop estimate"
-            )
-            result.set_dt(drop_dt, "RDAP expiry estimate + TLD window", "estimated", raw_s)
+            drop_dt       = datetime(drop_day.year, drop_day.month, drop_day.day, hour, minute, 0, tzinfo=UTC)
+            result.set_dt(drop_dt, "RDAP expiry estimate + TLD window", "estimated",
+                          f"expiry: {expiry_dt.isoformat()} -> +35d redemption -> +{days}d")
 
         else:
-            result.error = (
-                f"RDAP: domain found, status={status}, "
-                f"but no pendingDelete/expiry event date available"
-            )
+            result.error = f"RDAP: domain found, status={status}, but no usable date event available"
 
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            result.error = "RDAP: domain not found (may already be dropped or not in pendingDelete)"
-        else:
-            result.error = f"RDAP HTTP {e.code}: {e.reason}"
+        result.error = (
+            "RDAP: domain not found (already dropped or not in pendingDelete)"
+            if e.code == 404 else f"RDAP HTTP {e.code}: {e.reason}"
+        )
     except Exception as e:
         result.error = f"RDAP exception: {type(e).__name__}: {e}"
     return result
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# Technique 4 — Raw WHOIS socket + TLD drop window
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Technique 4 - Raw WHOIS socket + TLD drop window
+# =============================================================================
 
 def _fetch_whois(domain: str) -> DropResult:
-    """
-    Opens a raw TCP socket to the authoritative WHOIS server for the TLD,
-    sends the domain name, reads the response, and extracts Updated Date.
-    Then adds TLD-specific drop window offset to estimate drop time.
-    No external libraries required.
-    """
     result = DropResult(domain)
     try:
-        tld         = domain.rsplit(".", 1)[-1].lower()
-        whois_host  = WHOIS_SERVERS.get(tld, f"whois.nic.{tld}")
+        tld        = domain.rsplit(".", 1)[-1].lower()
+        whois_host = WHOIS_SERVERS.get(tld, f"whois.nic.{tld}")
 
         with socket.create_connection((whois_host, 43), timeout=12) as sock:
             sock.sendall(f"{domain}\r\n".encode("ascii"))
@@ -464,19 +514,13 @@ def _fetch_whois(domain: str) -> DropResult:
 
         updated_dt: Optional[datetime] = None
         for line in whois_text.splitlines():
-            ll = line.lower()
-            if any(k in ll for k in ("updated date", "last-updated", "last updated")):
-                m = re.search(
-                    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+\-]\d{2}:\d{2})?)",
-                    line,
-                )
+            if any(k in line.lower() for k in ("updated date", "last-updated", "last updated")):
+                m = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+\-]\d{2}:\d{2})?)", line)
                 if not m:
                     m = re.search(r"(\d{4}-\d{2}-\d{2})", line)
                 if m:
                     raw_s = m.group(1)
-                    updated_dt = datetime.fromisoformat(
-                        raw_s.replace("Z", "+00:00")
-                    )
+                    updated_dt = datetime.fromisoformat(raw_s.replace("Z", "+00:00"))
                     if updated_dt.tzinfo is None:
                         updated_dt = updated_dt.replace(tzinfo=UTC)
                     break
@@ -487,18 +531,17 @@ def _fetch_whois(domain: str) -> DropResult:
 
         days, hour, minute = TLD_DROP_WINDOWS.get(tld, DEFAULT_DROP_WINDOW)
         drop_day = (updated_dt + timedelta(days=days)).date()
-        drop_dt  = datetime(
-            drop_day.year, drop_day.month, drop_day.day,
-            hour, minute, 0, tzinfo=UTC,
+        drop_dt  = datetime(drop_day.year, drop_day.month, drop_day.day, hour, minute, 0, tzinfo=UTC)
+        result.set_dt(
+            drop_dt,
+            f"WHOIS ({whois_host}) + TLD window",
+            "estimated",
+            f"Updated Date: {updated_dt.date().isoformat()} -> +{days}d ~{hour:02d}:{minute:02d} UTC  "
+            f"[WARNING: may be off by 1-3 days]",
         )
-        raw_s = (
-            f"WHOIS Updated Date: {updated_dt.date().isoformat()} "
-            f"→ +{days}d ~{hour:02d}:{minute:02d} UTC"
-        )
-        result.set_dt(drop_dt, f"WHOIS ({whois_host}) + TLD window", "estimated", raw_s)
 
     except socket.gaierror as e:
-        result.error = f"WHOIS: DNS resolution failed for WHOIS server: {e}"
+        result.error = f"WHOIS: DNS resolution failed: {e}"
     except socket.timeout:
         result.error = "WHOIS: connection timed out"
     except Exception as e:
@@ -506,55 +549,60 @@ def _fetch_whois(domain: str) -> DropResult:
     return result
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # Auto-orchestrator
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
-async def get_drop_time(domain: str, technique: str = "auto") -> DropResult:
-    """
-    Main entry point. Returns a DropResult with the best available drop time.
-    technique options: "auto" | "nodriver" | "curl_cffi" | "rdap" | "whois"
-    """
+async def get_drop_time(
+    domain: str,
+    technique: str = "auto",
+    browser_path: Optional[str] = None,
+) -> DropResult:
     domain = _normalize_domain(domain)
 
-    if technique == "nodriver":  return await _fetch_nodriver(domain)
+    if technique == "nodriver":  return await _fetch_nodriver(domain, browser_path)
     if technique == "curl_cffi": return _fetch_curl_cffi(domain)
     if technique == "rdap":      return _fetch_rdap(domain)
     if technique == "whois":     return _fetch_whois(domain)
 
-    # AUTO: cascade
-    print(f"    ┌─ [1/4] nodriver (Chrome + Cloudflare bypass)…", flush=True)
-    r = await _fetch_nodriver(domain)
+    print(f"    +- [1/4] nodriver (Chrome + Cloudflare bypass)...", flush=True)
+    r = await _fetch_nodriver(domain, browser_path)
     if r.drop_dt_utc:
-        print(f"    └─ ✓ success")
+        print(f"    +- success")
         return r
-    print(f"    │     ✗ {r.error}")
+    print(f"    |     x {r.error}")
 
     for label, fn in [
         ("[2/4] curl-cffi (TLS impersonation)", _fetch_curl_cffi),
         ("[3/4] RDAP (IANA public API)",         _fetch_rdap),
         ("[4/4] WHOIS (raw socket)",              _fetch_whois),
     ]:
-        print(f"    ├─ {label}…", flush=True)
+        print(f"    +- {label}...", flush=True)
         r2 = fn(domain)
         if r2.drop_dt_utc:
-            print(f"    └─ ✓ success")
+            print(f"    +- success")
             return r2
-        print(f"    │     ✗ {r2.error}")
+        print(f"    |     x {r2.error}")
 
     r.error = "All four techniques failed."
     return r
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # CLI
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 async def _main() -> None:
     parser = argparse.ArgumentParser(
         prog="drop_time_scraper",
         description="Fetch exact/estimated drop time for pending-delete domains.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python drop_time_scraper.py zenithpicks.com\n"
+            "  python drop_time_scraper.py --technique rdap zenithpicks.com\n"
+            '  python drop_time_scraper.py --browser-path "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" zenithpicks.com\n'
+        ),
     )
     parser.add_argument("domains", nargs="+", metavar="DOMAIN")
     parser.add_argument(
@@ -562,17 +610,26 @@ async def _main() -> None:
         choices=["auto", "nodriver", "curl_cffi", "rdap", "whois"],
         default="auto",
     )
+    parser.add_argument(
+        "--browser-path", "-b",
+        metavar="PATH",
+        default=None,
+        help=(
+            'Path to Chrome/Chromium/Edge/Brave executable. '
+            'Also reads CHROME_PATH env var. '
+            'Example: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"'
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     results: list[DropResult] = []
     for domain in args.domains:
-        print(f"\n🔍  {domain}")
-        r = await get_drop_time(domain, args.technique)
+        print(f"\nLooking up: {domain}")
+        r = await get_drop_time(domain, args.technique, args.browser_path)
         results.append(r)
 
-    sep = "═" * 62
-    print(f"\n{sep}")
+    print("\n" + "=" * 62)
     if args.json:
         print(json.dumps([r.to_dict() for r in results], indent=2, default=str))
     else:
